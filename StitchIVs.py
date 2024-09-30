@@ -16,10 +16,10 @@ W2pW = 1e12
 ADC_BITS = 16
 R_FB = 5000*OHM
 R_CABLE = 0*OHM 
+R_COLD_SHUNT = 15 * mOHM
 ADC_GAIN = 2
 ADC_RANGE = 8
-R_COLD_SHUNT = 5*mOHM
-R_PARA = 15*mOHM # Is this the correct value?
+R_PARA = 15*mOHM
 R_TOTAL = R_CABLE + R_FB
 M_FB = 2.4
 ADC2A = 1/2**ADC_BITS *ADC_RANGE/(R_FB+R_CABLE) /M_FB/ADC_GAIN
@@ -71,7 +71,7 @@ def extract_runNumber(datadir): # Extract the run number from the datadir path
     parts = datadir.rstrip('/').split('/')
     return parts[-1]
 
-# Helper function
+# Finds data points two sigma outside of the center of the distribution
 def find_two_sigma_outliers(data):
     data = np.array(data)
     mean = np.mean(data)
@@ -94,12 +94,14 @@ def stitch_by_diffs(vb,isig):
         isig_stitched[flux_jump[0]+1:] = isig_stitched[flux_jump[0]+1:] - flux_jump[1] 
     return vb, isig_stitched
 
+# Finds outliers in the data determined on a threshold
 def detect_outliers_std(data, threshold=3):
     mean = np.mean(data)
     std_dev = np.std(data)
     outliers = [x for x in data if abs(x - mean) > threshold * std_dev]
     return outliers
 
+# Finds the transition of the superconducting branch to the normal branch in IV curve
 def find_SC_transition(vb, isig, A2uA=1.0):
     if len(isig) < 3:
         return -1, None  # Not enough data for derivative analysis
@@ -135,59 +137,42 @@ def find_SC_transition(vb, isig, A2uA=1.0):
     if transition_vb == 0:
         return -1, None
 
-    transition_vb *= 1e6
+    transition_vb = abs(transition_vb)
         
     return most_significant_index + 1, transition_vb
 
-def JumpBuster(vb, isig): 
-    sorted_indices = np.argsort(vb)  # Sort the arrays
-    vb = vb[sorted_indices]
-    isig = isig[sorted_indices]
-
-    vb -= vb[0]
-    isig -= isig[0]
-
-    vb_index, transition_vb = find_SC_transition(vb, isig)  # Implement your transition detection logic
-    outliers = detect_outliers_std(isig)
-
-    if isig[1] < 0 or isig[2] < 0:
-        vb, isig = stitch_by_diffs(vb, isig)
-
-    if transition_vb != None and vb_index != 0: # Found the transition
-        sc_vb = vb[:vb_index+1] 
-        sc_isig = isig[:vb_index+1]
-
-        sc_vb, sc_isig = stitch_by_diffs(sc_vb, sc_isig)
-
-        nm_vb = vb[vb_index+1:]
-        nm_isig = isig[vb_index+1:]
-
-        if nm_isig[-1] != 0 or nm_isig[-1] < 1e-1:
-            nm_isig -= nm_isig[-1]
-
-        vb = np.concatenate((sc_vb, nm_vb), axis=0)
-        isig = np.concatenate((sc_isig, nm_isig), axis=0)
-
-    else: # Transition not found
-        vb -= vb[0]
-        isig -= isig[0]
-        vb, isig = stitch_by_diffs(vb, isig)
-        return vb, isig
-
-    isig_list = isig.tolist()
-    outliers_set = set(outliers)
-
-    # Filter out the outliers from isig and vb
-    filtered_indices = [i for i in range(len(isig)) if isig[i] not in outliers_set]
-    vb = vb[filtered_indices]
-    isig = isig[filtered_indices]
-        
-    return vb, isig
-
 STITCHING_METHODS = {"JumpBuster":JumpBuster, "none":none}
 
-# Main plotting function, can plot IV, RV, or PV plots
-def plot_sweep(ibis, datadir, rns, exclude, include, stitch_type="", plot_type=""):
+# Finds the slope of the superconducting branch to determine the parasitic resistance
+def find_slope_sc_branch(vb, isig, SC_trans_index):
+    # Superconducting branch data extraction
+    sc_vb = vb[:SC_trans_index+1]
+    sc_vb = [v * 1e2 for v in sc_vb]  # Convert vb to proper units (V)
+    
+    # A2uA = 1e6  # Conversion factor for current (A to µA)
+    sc_isig = [i * A2uA for i in isig[:SC_trans_index+1]]
+    
+    # Check if we have enough data points
+    if len(sc_vb) < 2 or len(sc_isig) < 2:
+        # print("Not enough data points for fitting.")
+        return 0  # or return a default slope
+
+    # Check if all values are the same
+    if np.all(np.array(sc_vb) == sc_vb[0]) or np.all(np.array(sc_isig) == sc_isig[0]):
+        # print("Insufficient variation in data points for fitting.")
+        return 0  # or return a default slope
+
+    # Calculate the slope of the superconducting branch
+    try:
+        slope, _ = np.polyfit(sc_vb, sc_isig, 1)
+    except np.linalg.LinAlgError as e:
+        # print(f"Linear fit error: {e}")
+        return 0  # or return a default slope
+
+    return slope  # returns slope of superconducting branch adjusted for unit conversions
+
+#  Function for plotting current, resistance, or power through the tes versus the bias voltage
+def plot_sweep(ibis, datadir, rns, exclude, include, stitch_type="", plot_type="", axs=None):
     # Title/ Table Info
     runNumber = extract_runNumber(datadir)
     start = rns[0]
@@ -217,13 +202,12 @@ def plot_sweep(ibis, datadir, rns, exclude, include, stitch_type="", plot_type="
     for tes in range(len(NAMES)):
         if NAMES[tes] in include:
             # Extract and convert vb and isig
-            vb = ibis[:, tes, 0] * uA2A
-            isig = ibis[:, tes, 1]
-
-
+            I_bias = ibis[:, tes, 0]
+            vb = I_bias * R_COLD_SHUNT * 1e2 # Convert I_b to v_b by value of shunt resistor
+            isig = ibis[:, tes, 1] * A2uA
+        
             SC_trans_index, transition_vb = find_SC_transition(vb, isig)
-            sc_transition_isig = vb[SC_trans_index]
-            
+
             if NAMES[tes] in exclude or np.all(vb == 0) or np.all(isig == 0):
                 TES.append(NAMES[tes])
                 SC_VB.append("N/A")
@@ -231,73 +215,87 @@ def plot_sweep(ibis, datadir, rns, exclude, include, stitch_type="", plot_type="
             
             TES.append(NAMES[tes])
 
-            if np.all(vb == 0) or np.all(isig == 0): # Check if data is logical, if not, skip
+            if np.all(vb == 0) or np.all(isig == 0):  # Check if data is logical, if not, skip
+                SC_VB.append("N/A")
                 continue
             
             trans = "N/A"
             if transition_vb is not None:
-                trans = transition_vb
-                trans = float(trans)
-                if trans == 0.00:
-                    SC_VB.append("N/A")
-                else:
-                    SC_VB.append(f"{trans:.2f}")
+                trans = float(transition_vb)
+                SC_VB.append(f"{trans:.2f}" if trans != 0.00 else "N/A")
             else:
                 SC_VB.append(trans)
             
             # Apply the stitching method if necessary
-            if stitch_type in STITCHING_METHODS:
-                if stitch_type != "none":
-                    vb, isig = STITCHING_METHODS[stitch_type](vb, isig)
-            else:
+            if stitch_type in STITCHING_METHODS and stitch_type != "none":
+                vb, isig = STITCHING_METHODS[stitch_type](vb, isig)
+            elif stitch_type != "none":
                 print("Not a valid stitching method.")
 
-            if np.all(isig == 0): # Check if data is logical, if not, skip
+            if np.all(isig == 0):  # Check if data is logical, if not, skip
                 SC_VB.pop()
                 SC_VB.append("N/A")
+                continue
             
             # Plotting based on plot_type
             for i, ptype in enumerate(plot_types):
                 ax = axs[i]
-
+                
                 if ptype == "iv": 
-                    ax.plot(vb * A2uA, isig * A2uA, '.', color=cs[tes], label=NAMES[tes])
+                    ax.plot(vb, isig, '.', color=cs[tes], label=NAMES[tes])  # Plot I-V curve
                     ax.set_ylabel(r'Measured TES branch current ($\mu$A)')
-                    ax.set_xlabel(r'TES bias (nV)')  
+                    ax.set_xlabel(r'TES bias (V)') 
+                    # ax.set_xlim(vb.min() * 1e2, vb.max() * 1e2)
 
-                elif ptype == "rv" or ptype == "pv":
-                    safe_isig = np.where(isig != 0, isig, 1e-16)
-                    rp = np.mean(vb[0:SC_trans_index] / safe_isig[0:SC_trans_index])
-                    r = (vb / safe_isig) - rp
-                    
-                    if ptype == "rv":
-                        lower_y_lim = np.percentile(r, 10) 
-                        upper_y_lim = np.percentile(r, 90) 
-                        y_val = max(abs(lower_y_lim), abs(upper_y_lim))
-                        
-                        ax.plot(vb[:-1] * A2uA, abs(r[:-1]), '.', color=cs[tes], label=NAMES[tes])
-                        ax.set_ylabel(r'R($\Omega$)')
-                        ax.set_xlabel(r'TES bias (nV)')
-                        ax.set_xlim(vb.min() * A2uA, vb.max() * A2uA)  # Convert x-limits to the desired unit
-                        ax.set_ylim(-y_val, y_val)
-                        
-                    else:  # PV plot
-                        num = R_COLD_SHUNT * isig
-                        R_tot = R_COLD_SHUNT + R_PARA
-                        denom = R_tot + r
-                        I_S = num / denom
-                        power = (I_S**2 * r * W2pW)
-                        
-                        lower_y_lim = np.percentile(power, 5)   
-                        upper_y_lim = np.percentile(power, 95) 
-                        y_val = max(abs(lower_y_lim), abs(upper_y_lim))
+                ####### MATH #######
+                I_tes = np.where(isig != 0, isig, 1e-16)  # Avoid div by zero error by setting tiny value
+                min_length = min(len(vb), len(I_tes))  # Find minimum length to avoid mismatch
+                
+                if len(vb) != min_length:
+                    vb = vb[:min_length]
+                if len(I_tes) != min_length:
+                    I_tes = I_tes[:min_length]
 
-                        ax.plot(vb * A2uA, power, '.', color=cs[tes], label=NAMES[tes])
-                        ax.set_ylabel(r'P (pW)')
-                        ax.set_xlabel(r'TES bias (nV)')
-                        ax.set_xlim(vb.min() * A2uA, vb.max() * A2uA)  
-                        ax.set_ylim(-y_val, y_val)
-                        
+                slope = find_slope_sc_branch(vb, isig, SC_trans_index)
+
+                # Calculate TES resistance, subtract the SC slope (adjusting units as needed)
+                r_tes = (R_COLD_SHUNT) * ((I_bias[:min_length] / I_tes) - 1) - (R_PARA)
+                for i in range(len(r_tes)):
+                    r_tes[i] = (r_tes[i] - slope)
+                # r_tes -= slope  # Adjust slope units to MΩ before subtracting
+                # r_tes *= 1e-6 # Megaohms
+
+                if len(r_tes) != len(vb):
+                    r_tes = r_tes[:len(vb)]  # Adjust shape to match vb
+
+                # Calculate power through TES
+                power_tes = (isig[:len(vb)] ** 2 * r_tes)  # Power through TES
+                ####### MATH #######
+                
+                if ptype == "rv":  # Plot resistance through TES
+                    # r_tes *= 1e-6  # Convert to MΩ
+                    lower_y_lim = np.percentile(r_tes, 10)
+                    upper_y_lim = np.percentile(r_tes, 90)
+                    y_val = max(abs(lower_y_lim), abs(upper_y_lim))
+                
+                    ax.plot(vb[:-1], abs(r_tes[:-1]), '.', color=cs[tes], label=NAMES[tes])  # Plot R-V curve
+                    ax.set_ylabel(r'R(M$\Omega$)')
+                    ax.set_xlabel(r'TES bias (V)')
+                    # ax.set_xlim(vb.min(), vb.max())  # Convert x-limits
+                    # ax.set_ylim(0, y_val)
+                
+                if ptype == "pv":  # Power through TES
+                    power_tes *= 1e6  # Convert to µW
+                    lower_y_lim = np.percentile(power_tes, 5)
+                    upper_y_lim = np.percentile(power_tes, 95)
+                    y_val = max(abs(lower_y_lim), abs(upper_y_lim))
+                
+                    ax.plot(vb, power_tes, '.', color=cs[tes], label=NAMES[tes])
+                    ax.set_ylabel(r'P (µW)')
+                    ax.set_xlabel(r'TES bias (V)')
+                    ax.set_xlim(vb.min(), vb.max())
+                    ax.set_ylim(0, y_val)
+
             # Remove legend from plot if it exists
             for ax in axs:
                 legend = ax.get_legend()
@@ -310,25 +308,27 @@ def plot_sweep(ibis, datadir, rns, exclude, include, stitch_type="", plot_type="
 
     # Plot the table, regardless of plot type
     TES.append("Stitch Type")
-    SC_VB.append(stitch_type) 
-    table_data = []
-    for i in range(len(TES)):
-        table_data.append([TES[i], SC_VB[i]])
-
+    SC_VB.append(stitch_type)
+    table_data = [[TES[i], SC_VB[i]] for i in range(len(TES))]
+    
     # Add the table to the first axis
-    axs[0].table(cellText=table_data, colLabels=['TES', 'Transition (nV)'], cellLoc='center', loc='center', bbox=[-1, 0, .7, 1])
+    table = axs[0].table(cellText=table_data, colLabels=['TES', 'Transition (V)'],
+                         cellLoc='center', loc='bottom', bbox=[-1, 0, .7, 1])  # Adjust bbox values
     
     # Color the table cells based on TES colors
     for i, key in enumerate(TES):
         if key == "Stitch Type":
             continue
         row_index = i
-        cell = axs[0].tables[0][(row_index + 1, 0)]
-        color = cs[i] 
-        cell.set_text_props(color=color)
-
+        cell = table[(row_index + 1, 0)]  # +1 to skip the header
+        color = cs[i] if i < len(cs) else 'white'  # Ensure there's a color for each row
+        cell.set_facecolor(color)  # Set cell background color
+        cell.set_text_props(color='black')  # Ensure text is visible
+    
+    # Set title
     plt.suptitle(f"{runNumber}: Runs {start}-{end}")
     if num_plots != 1:
         plt.tight_layout(rect=[0, .01, 1, 0.99]) 
         plt.subplots_adjust(wspace=0.35) 
     plt.show()
+    # return axs
